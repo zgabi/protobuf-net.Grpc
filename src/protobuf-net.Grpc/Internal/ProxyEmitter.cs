@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace ProtoBuf.Grpc.Internal
 {
@@ -171,18 +172,97 @@ namespace ProtoBuf.Grpc.Internal
 
                 int marshallerIndex = 0;
                 Dictionary<Type, (FieldBuilder Field, string Name, object Instance)> marshallers = new Dictionary<Type, (FieldBuilder, string, object)>();
+                var marshallerFactory = new ValueTypeWrapperMarshallerFactory(binderConfig.MarshallerCache);
+                var marshallerCache = new MarshallerCache(new[] { marshallerFactory }, binderConfig.MarshallerCache);
                 FieldBuilder Marshaller(Type forType)
                 {
                     if (marshallers.TryGetValue(forType, out var val)) return val.Field;
 
-                    var instance = s_marshallerCacheGenericMethodDef.MakeGenericMethod(forType).Invoke(binderConfig.MarshallerCache, Array.Empty<object>())!;
+                    var instance = s_marshallerCacheGenericMethodDef.MakeGenericMethod(forType).Invoke(marshallerCache, Array.Empty<object>())!;
                     var name = "_m" + marshallerIndex++;
                     var field = type.DefineField(name, typeof(Marshaller<>).MakeGenericType(forType), FieldAttributes.Static | FieldAttributes.Private); // **not** readonly, we need to set it afterwards!
                     marshallers.Add(forType, (field, name, instance));
                     return field;
-
                 }
 
+                                int valueTypeWrapperTaskContinuationIndex = 0;
+                Dictionary<Type, MethodBuilder> valueTypeWrapperTaskContinuations = new Dictionary<Type, MethodBuilder>();
+                MethodBuilder ValueTypeWrapperTaskContinuation(Type forType)
+                {
+                    if (valueTypeWrapperTaskContinuations.TryGetValue(forType, out var val)) return val;
+
+                    var continuationName = "Cont" + valueTypeWrapperTaskContinuationIndex++;
+                    var valueTypeWrapperType = typeof(ValueTypeWrapper<>).MakeGenericType(forType);
+                    var inputType = typeof(Task<>).MakeGenericType(valueTypeWrapperType);
+                    var continuation = type.DefineMethod(continuationName,
+                        MethodAttributes.HideBySig | MethodAttributes.Private | MethodAttributes.Static,
+                        forType, new[] { inputType });
+                    var il = continuation.GetILGenerator();
+                    il.Emit(OpCodes.Ldarg_0); // original task
+                    var resultProperty = inputType.GetProperty("Result").GetGetMethod();
+                    il.EmitCall(OpCodes.Callvirt, resultProperty, null);
+                    var valueField = valueTypeWrapperType.GetField("Value");
+                    il.Emit(OpCodes.Ldfld, valueField);
+                    il.Emit(OpCodes.Ret);
+
+
+                    valueTypeWrapperTaskContinuations.Add(forType, continuation);
+                    return continuation;
+                }
+
+                int valueTypeWrapperTaskAdapterIndex = 0;
+                Dictionary<Type, MethodBuilder> valueTypeWrapperTaskAdapters = new Dictionary<Type, MethodBuilder>();
+                MethodBuilder ValueTypeWrapperTaskAdapter(Type forType)
+                {
+                    if (valueTypeWrapperTaskAdapters.TryGetValue(forType, out var val)) return val;
+
+                    var adapterName = "Vtwta" + valueTypeWrapperTaskAdapterIndex++;
+                    var taskGenericType = forType.GetGenericTypeDefinition();
+                    var isValueTask = taskGenericType == typeof(ValueTask<>);
+                    var resultType = forType.GetGenericArguments()[0];
+                    var valueTypeWrapperType = typeof(ValueTypeWrapper<>).MakeGenericType(resultType);
+                    var inputType = taskGenericType.MakeGenericType(valueTypeWrapperType);
+                    var adapter = type.DefineMethod(adapterName,
+                        MethodAttributes.HideBySig | MethodAttributes.Private | MethodAttributes.Static,
+                        forType, new[] { inputType });
+                    var il = adapter.GetILGenerator();
+                    if (isValueTask)
+                    {
+                        Ldarga(il, 0); // address of original ValueTask
+                        var asTask = inputType.GetMethod(nameof(ValueTask.AsTask));
+                        il.EmitCall(OpCodes.Call, asTask, null); // .AsTask()
+                        // the stack now has a ref to a Task<ValueTypeWrapper<T>> on top
+                        inputType = typeof(Task<>).MakeGenericType(typeof(ValueTypeWrapper<>).MakeGenericType(resultType));
+                    }
+                    else
+                    {
+                        il.Emit(OpCodes.Ldarg_0); // original Task
+                    }
+
+                    var continuation = ValueTypeWrapperTaskContinuation(resultType);
+
+                    il.Emit(OpCodes.Ldnull);
+                    il.Emit(OpCodes.Ldftn, continuation);
+                    var funcType = typeof(Func<,>).MakeGenericType(inputType, resultType);
+                    var funcConstructor = funcType.GetConstructors().Single();
+                    il.Emit(OpCodes.Newobj, funcConstructor);
+
+                    var continueWith = ReflectionHelper.GetContinueWithForTask(valueTypeWrapperType, resultType);
+                    il.EmitCall(OpCodes.Callvirt, continueWith, null);
+
+                    if (isValueTask)
+                    {
+                        // change back to a ValueTask
+                        var valueTaskConstructor = forType.GetConstructor(new[] { typeof(Task<>).MakeGenericType(resultType) });
+                        il.Emit(OpCodes.Newobj, valueTaskConstructor);
+                    }
+
+                    il.Emit(OpCodes.Ret);
+
+                    valueTypeWrapperTaskAdapters.Add(forType, adapter);
+                    return adapter;
+                }
+                
                 int fieldIndex = 0;
                 foreach (var iType in ContractOperation.ExpandInterfaces(typeof(TService)))
                 {
@@ -195,6 +275,7 @@ namespace ProtoBuf.Grpc.Internal
                     foreach (var iMethod in iType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
                     {
                         var pTypes = Array.ConvertAll(iMethod.GetParameters(), x => x.ParameterType);
+                        var retType = iMethod.ReturnType;
                         var impl = type.DefineMethod(iType.Name + "." + iMethod.Name,
                                 MethodAttributes.HideBySig | MethodAttributes.Final | MethodAttributes.NewSlot | MethodAttributes.Private | MethodAttributes.Virtual,
                                 iMethod.CallingConvention, iMethod.ReturnType, pTypes);
@@ -226,7 +307,7 @@ namespace ProtoBuf.Grpc.Internal
                         switch (op.Context)
                         {
                             case ContextKind.CallOptions:
-                                // we only support this for signatures that match the exat google pattern, but:
+                                // we only support this for signatures that match the excat google pattern, but:
                                 // defer for now
                                 il.ThrowException(typeof(NotImplementedException));
                                 break;
@@ -246,7 +327,10 @@ namespace ProtoBuf.Grpc.Internal
                                     switch (op.Context)
                                     {
                                         case ContextKind.CallContext:
-                                            Ldarga(il, op.VoidRequest ? (ushort)1 : (ushort)2);
+                                            // last argument, plus "this" is pTypes.Length
+                                            Ldarga(il, (ushort)pTypes.Length);
+                                            // from now on only keep "data" arguments
+                                            pTypes = pTypes.Take(pTypes.Length - 1).ToArray();
                                             break;
                                         case ContextKind.CancellationToken:
                                             var callContext = il.DeclareLocal(typeof(CallContext));
@@ -272,10 +356,47 @@ namespace ProtoBuf.Grpc.Internal
                                     }
                                     else
                                     {
-                                        il.Emit(OpCodes.Ldarg_1); // request
+                                        if (op.MethodType == MethodType.Unary || op.MethodType == MethodType.ServerStreaming)
+                                        {
+                                            if (pTypes.Length > 1)
+                                            {
+                                                for (int i = 0; i < pTypes.Length; i++)
+                                                    Ldarg(il, (ushort)(i + 1));
+
+                                                EmitTupleConstructor(il, pTypes); // request as a new Tuple<>
+                                            }
+                                            else if (pTypes.Length == 1 && !pTypes[0].IsClass)
+                                            {
+                                                il.Emit(OpCodes.Ldarg_1); // unwrapped request
+                                                var constructor = typeof(ValueTypeWrapper<>).MakeGenericType(pTypes[0]).GetConstructors().Single();
+                                                il.Emit(OpCodes.Newobj, constructor); // request wrapped in a ValueTypeWrapper
+                                            }
+                                            else
+                                            {
+                                                il.Emit(OpCodes.Ldarg_1); // request
+                                            }
+                                        }
+                                        else
+                                        {
+                                            il.Emit(OpCodes.Ldarg_1); // request
+                                        }
                                     }
                                     il.Emit(OpCodes.Ldnull); // host (always null)
                                     il.EmitCall(OpCodes.Call, method, null);
+                                    // similar logic than in ContractOperation.GetSignature : look at the implemented method return type
+                                    if (op.Result == ResultKind.Sync && !op.VoidResponse && !retType.IsClass)
+                                    {
+                                        var retValueTypeWrapperType = typeof(ValueTypeWrapper<>).MakeGenericType(retType);
+                                        var valueField = retValueTypeWrapperType.GetField("Value");
+                                        il.Emit(OpCodes.Ldfld, valueField);
+                                    }
+                                    else if ((op.Result == ResultKind.Task || op.Result == ResultKind.ValueTask) &&
+                                             !op.VoidResponse && !retType.GetGenericArguments()[0].IsClass)
+                                    {
+                                        var adapter = ValueTypeWrapperTaskAdapter(retType);
+                                        il.EmitCall(OpCodes.Call, adapter, null);
+                                    }
+
                                     il.Emit(OpCodes.Ret); // return
                                 }
                                 break;
@@ -294,6 +415,7 @@ namespace ProtoBuf.Grpc.Internal
 #else
                 var finalType = type.CreateType()!;
 #endif
+                
                 // assign the marshallers and invoke the init
                 foreach((var field, var name, var instance) in marshallers.Values)
                 {
@@ -322,6 +444,34 @@ namespace ProtoBuf.Grpc.Internal
                 }
             }
         }
+        
+        private static Type EmitTupleConstructor(ILGenerator il, Type[] types)
+        {
+            Type tupleType;
+            if (types.Length > 7)
+            {
+                var rest = EmitTupleConstructor(il, types.Skip(7).ToArray());
+                tupleType = typeof(Tuple<,,,,,,,>).MakeGenericType(types.Take(7).Concat(new [] { rest }).ToArray());
+            }
+            else
+            {
+                tupleType = types.Length switch
+                {
+                    1 => typeof(Tuple<>).MakeGenericType(types),
+                    2 => typeof(Tuple<,>).MakeGenericType(types),
+                    3 => typeof(Tuple<,,>).MakeGenericType(types),
+                    4 => typeof(Tuple<,,,>).MakeGenericType(types),
+                    5 => typeof(Tuple<,,,,>).MakeGenericType(types),
+                    6 => typeof(Tuple<,,,,,>).MakeGenericType(types),
+                    7 => typeof(Tuple<,,,,,,>).MakeGenericType(types),
+                    _ => throw new ArgumentException() // not actually possible
+                };
+            }
+            var constructor = tupleType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Single();
+            il.Emit(OpCodes.Newobj, constructor);
+            return tupleType;
+        }
+        
         internal static readonly FieldInfo
             s_CallContext_Default = typeof(CallContext).GetField(nameof(CallContext.Default))!,
 #pragma warning disable CS0618 // Empty

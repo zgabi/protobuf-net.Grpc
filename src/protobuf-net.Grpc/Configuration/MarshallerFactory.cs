@@ -17,13 +17,13 @@ namespace ProtoBuf.Grpc.Configuration
         /// <summary>
         /// Deserializes an object from a payload
         /// </summary>
-        protected virtual T Deserialize<T>(byte[] payload)
+        protected internal virtual T Deserialize<T>(byte[] payload)
             => throw new NotImplementedException("You must override either CreateMarshaller or both Serialize/Deserialize");
 
         /// <summary>
         /// Serializes an object to a payload
         /// </summary>
-        protected virtual byte[] Serialize<T>(T value)
+        protected internal virtual byte[] Serialize<T>(T value)
             => throw new NotImplementedException("You must override either CreateMarshaller or both Serialize/Deserialize");
 
         /// <summary>

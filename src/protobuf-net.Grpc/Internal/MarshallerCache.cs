@@ -10,8 +10,13 @@ namespace ProtoBuf.Grpc.Internal
     internal sealed class MarshallerCache
     {
         private readonly MarshallerFactory[] _factories;
-        public MarshallerCache(MarshallerFactory[] factories)
-            => _factories = factories ?? throw new ArgumentNullException(nameof(factories));
+
+        public MarshallerCache(MarshallerFactory[] factories, MarshallerCache? innerCache = null)
+        {
+            _factories = factories ?? throw new ArgumentNullException(nameof(factories));
+            if (innerCache != null) _marshallers = innerCache._marshallers;
+        }
+
         internal bool CanSerializeType(Type type)
         {
             if (_marshallers.TryGetValue(type, out var obj)) return obj != null;
@@ -55,7 +60,7 @@ namespace ProtoBuf.Grpc.Internal
         private Marshaller<T>? CreateAndAdd<T>()
         {
             object? obj = CreateMarshaller<T>();
-            if (!_marshallers.TryAdd(typeof(T), obj)) obj= _marshallers[typeof(T)];
+            if (!_marshallers.TryAdd(typeof(T), obj)) obj = _marshallers[typeof(T)];
             return obj as Marshaller<T>;
         }
         private Marshaller<T>? CreateMarshaller<T>()

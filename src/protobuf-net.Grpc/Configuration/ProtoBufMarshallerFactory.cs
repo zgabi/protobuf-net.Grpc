@@ -189,7 +189,7 @@ namespace ProtoBuf.Grpc.Configuration
         /// <summary>
         /// Deserializes an object from a payload
         /// </summary>
-        protected override T Deserialize<T>(byte[] payload)
+        protected internal override T Deserialize<T>(byte[] payload)
         {
             IProtoInput<byte[]> segmentReader = _model;
             return segmentReader.Deserialize<T>(payload, userState: _userState);
@@ -198,7 +198,7 @@ namespace ProtoBuf.Grpc.Configuration
         /// <summary>
         /// Serializes an object to a payload
         /// </summary>
-        protected override byte[] Serialize<T>(T value)
+        protected internal override byte[] Serialize<T>(T value)
         {
             using var ms = new MemoryStream();
             _model.Serialize(ms, value, context: null);
